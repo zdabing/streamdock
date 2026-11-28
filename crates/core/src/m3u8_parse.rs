@@ -229,12 +229,67 @@ fn parse_manifest_text(text: &str) -> ParsedManifest {
     out
 }
 
+fn has_auth_query_params(url: &Url) -> bool {
+    url.query_pairs().any(|(k, _)| {
+        matches!(
+            k.to_ascii_lowercase().as_str(),
+            "token"
+                | "expires"
+                | "token_path"
+                | "vid"
+                | "sign"
+                | "sig"
+                | "signature"
+                | "auth_key"
+                | "hdnts"
+                | "policy"
+                | "key-pair-id"
+                | "x-amz-signature"
+                | "x-amz-credential"
+                | "x-amz-security-token"
+                | "wssecret"
+                | "wstime"
+                | "txsecret"
+                | "txtime"
+                | "t"
+                | "e"
+                | "key"
+                | "auth"
+        )
+    })
+}
+
 fn resolve_uri(base: &str, relative: &str) -> CoreResult<String> {
     if relative.contains("://") {
         return Ok(relative.to_string());
     }
     if let Ok(base_url) = Url::parse(base) {
-        if let Ok(joined) = base_url.join(relative) {
+        if let Ok(mut joined) = base_url.join(relative) {
+            if !relative.contains('?')
+                && joined.query().is_none()
+                && joined.origin() == base_url.origin()
+                && has_auth_query_params(&base_url)
+            {
+                let pairs: Vec<(String, String)> = base_url
+                    .query_pairs()
+                    .map(|(k, v)| {
+                        let key = k.into_owned();
+                        let val = if key == "token_path" {
+                            crate::video_parser::signed_site::normalize_token_path(&v)
+                        } else {
+                            v.into_owned()
+                        };
+                        (key, val)
+                    })
+                    .collect();
+                if !pairs.is_empty() {
+                    let mut qp = joined.query_pairs_mut();
+                    qp.clear();
+                    for (k, v) in pairs {
+                        qp.append_pair(&k, &v);
+                    }
+                }
+            }
             return Ok(joined.to_string());
         }
     }

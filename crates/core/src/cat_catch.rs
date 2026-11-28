@@ -1,4 +1,4 @@
-use crate::contract::{HeaderInput, InputTypeKind, TaskOptions};
+use crate::contract::{HeaderInput, HlsTokenSession, InputTypeKind, TaskOptions};
 use crate::error::{CoreError, CoreResult};
 use crate::format_options::{DIRECT_FILE_EXTENSIONS, path_extname_lower};
 use crate::http::{is_valid_header_value_str, md5_hex, normalize_download_url};
@@ -114,6 +114,91 @@ fn extract_captured_headers(
         out.insert(name, serde_json::Value::String(stored));
     }
     Ok(out)
+}
+
+fn parse_token_session(
+    item: &serde_json::Map<String, serde_json::Value>,
+    playlist_url: &str,
+) -> Option<HlsTokenSession> {
+    let raw = item.get("tokenSession")?.as_object()?;
+    let origin_raw = raw.get("origin").and_then(|v| v.as_str())?.trim();
+    let player_raw = raw
+        .get("playerUrl")
+        .or_else(|| raw.get("player_url"))
+        .and_then(|v| v.as_str())?
+        .trim();
+    let origin_url = Url::parse(origin_raw).ok()?;
+    let player_url = Url::parse(player_raw).ok()?;
+    if !matches!(origin_url.scheme(), "http" | "https")
+        || !matches!(player_url.scheme(), "http" | "https")
+        || origin_url.origin() != player_url.origin()
+    {
+        return None;
+    }
+
+    let session_id = raw
+        .get("sessionId")
+        .or_else(|| raw.get("session_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let movie_id = raw
+        .get("movieId")
+        .or_else(|| raw.get("movie_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let api_secret = raw
+        .get("apiSecret")
+        .or_else(|| raw.get("api_secret"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let guid_id = raw
+        .get("guidId")
+        .or_else(|| raw.get("guid_id"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
+    let api_secret_issued_at = raw
+        .get("apiSecretIssuedAt")
+        .or_else(|| raw.get("api_secret_issued_at"))
+        .filter(|v| !v.is_null())
+        .cloned();
+    let time_diff_ms = raw
+        .get("timeDiffMs")
+        .or_else(|| raw.get("timeDiff"))
+        .or_else(|| raw.get("time_diff_ms"))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_f64().map(|f| f as i64))
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
+        })
+        .unwrap_or(0);
+
+    let cookie = raw
+        .get("cookie")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_valid_header_value_str(s))
+        .map(str::to_string);
+
+    Some(HlsTokenSession {
+        origin: origin_url.origin().ascii_serialization(),
+        player_url: player_url.to_string(),
+        base_signed_url: playlist_url.to_string(),
+        session_id,
+        movie_id,
+        guid_id,
+        api_secret,
+        api_secret_issued_at,
+        time_diff_ms,
+        cookie,
+    })
 }
 
 pub fn cat_catch_tasks(payload: &serde_json::Value) -> CoreResult<Vec<CatCatchTaskInput>> {
@@ -245,6 +330,12 @@ pub fn cat_catch_tasks(payload: &serde_json::Value) -> CoreResult<Vec<CatCatchTa
             InputTypeKind::M3u8
         };
 
+        let token_session = if task_type == InputTypeKind::M3u8 {
+            parse_token_session(item, &url)
+        } else {
+            None
+        };
+
         tasks.push(CatCatchTaskInput {
             url: url.clone(),
             options: TaskOptions {
@@ -256,6 +347,7 @@ pub fn cat_catch_tasks(payload: &serde_json::Value) -> CoreResult<Vec<CatCatchTa
                 save_dir: None,
                 ignore_segments: None,
                 headers: Some(HeaderInput::Map(headers)),
+                token_session,
                 scrape_meta: None,
                 retry_failed_only: None,
             },

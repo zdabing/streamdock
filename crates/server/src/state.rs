@@ -1578,6 +1578,10 @@ pub fn merge_task_options(base: Option<&TaskOptions>, over: &TaskOptions) -> Tas
             .clone()
             .or_else(|| b.ignore_segments.clone()),
         headers: over.headers.clone().or_else(|| b.headers.clone()),
+        token_session: over
+            .token_session
+            .clone()
+            .or_else(|| b.token_session.clone()),
         scrape_meta: over.scrape_meta.clone().or_else(|| b.scrape_meta.clone()),
         retry_failed_only: over.retry_failed_only.or(b.retry_failed_only),
     }
@@ -1612,6 +1616,7 @@ pub fn build_exec_options_from(
         proxy_mode: Some(cfg.proxy_mode),
         proxy_url: Some(cfg.proxy_url.clone()),
         no_proxy: Some(cfg.no_proxy.clone()),
+        token_session: opts.token_session.clone(),
         segment_identity: None,
         on_progress: None,
         on_merge_progress: None,

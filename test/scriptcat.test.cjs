@@ -2,24 +2,47 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
-const { httpUrl, mediaType, scopedHeaders, referrerFor, cookieHeader, payloadFor } = require('../examples/scriptcat-downloader.user.js');
+const {
+  httpUrl,
+  mediaType,
+  scopedHeaders,
+  referrerFor,
+  cookieHeader,
+  payloadFor,
+  extractTokenSessionFromText,
+  applyFreshTokenToUrl,
+} = require('../examples/scriptcat-downloader.user.js');
 
 test('ScriptCat preserves signed queries, titles and separate page/media credential identities', () => {
   const url = 'https://cdn.example/a/video.m3u8?token=a%2Bb&expires=9999999999&token_path=%2Fa%2F';
   assert.equal(httpUrl(url), url);
   assert.equal(httpUrl('javascript:alert(1)'), '');
   assert.equal(httpUrl('https://user:pass@example.com/a'), '');
-  const item = { url, type: mediaType(url), headers: { origin: 'https://page.example', referer: 'https://page.example/', authorization: 'media-token' } };
+  const item = {
+    url,
+    type: mediaType(url),
+    headers: { origin: 'https://page.example', referer: 'https://page.example/', authorization: 'media-token' },
+  };
   const payload = payloadFor(item, '作品 / 第1集', 'https://page.example/detail/1', 'cdn=session');
   assert.equal(payload.name, '作品 _ 第1集.mp4');
   assert.equal(payload.url, url);
   assert.equal(payload.sourceUrl, 'https://page.example/detail/1');
   assert.equal(payload.requestHeaders.cookie, 'cdn=session');
   assert.equal(payload.requestHeaders.authorization, 'media-token');
-  assert.equal(payloadFor({ ...item, url: 'https://cdn.example/zh.vtt', type: 'text/vtt' }, '作品', payload.sourceUrl, '').name, '作品.zh.vtt');
+  assert.equal(
+    payloadFor({ ...item, url: 'https://cdn.example/zh.vtt', type: 'text/vtt' }, '作品', payload.sourceUrl, '').name,
+    '作品.zh.vtt'
+  );
   assert.equal(mediaType('https://cdn.example/index.txt', 'application/x-mpegURL'), 'application/vnd.apple.mpegurl');
   assert.equal(mediaType('https://cdn.example/video.ts'), '');
-  assert.deepEqual(scopedHeaders({ Cookie: 'secret', Authorization: 'secret', Origin: 'https://page.example', Host: 'bad' }, url, 'https://other.example/a'), { origin: 'https://page.example' });
+  assert.deepEqual(
+    scopedHeaders(
+      { Cookie: 'secret', Authorization: 'secret', Origin: 'https://page.example', Host: 'bad' },
+      url,
+      'https://other.example/a'
+    ),
+    { origin: 'https://page.example' }
+  );
   assert.equal(referrerFor('https://page.example/detail/1', url), 'https://page.example/');
   assert.equal(referrerFor('https://page.example/detail/1', 'https://page.example/a'), 'https://page.example/detail/1');
   assert.equal(referrerFor('https://page.example/detail/1', url, 'no-referrer'), '');
@@ -27,7 +50,8 @@ test('ScriptCat preserves signed queries, titles and separate page/media credent
 
 test('ScriptCat cookie selection scopes HttpOnly cookies to media host, path, scheme and expiry', () => {
   const cookie = { name: 'session', value: 'media', domain: '.cdn.example', path: '/a', httpOnly: true, secure: true };
-  const cookies = [cookie,
+  const cookies = [
+    cookie,
     { ...cookie, domain: 'page.example', name: 'page' },
     { ...cookie, path: '/ab', name: 'wrongpath' },
     { ...cookie, hostOnly: true, name: 'hostonly' },
@@ -40,7 +64,8 @@ test('ScriptCat cookie selection scopes HttpOnly cookies to media host, path, sc
 });
 
 test('ScriptCat recognizes extensionless object storage links without altering signatures', () => {
-  const url = 'https://storage.example/8895809daf474dc68854afd2ff38ca8e086?response-content-disposition=attachment%3B%20filename%2A%3DUTF-8%27%27Love.in.Disguise.S01E03.mp4&X-Amz-Signature=a%2Bb&X-Amz-Expires=900';
+  const url =
+    'https://storage.example/8895809daf474dc68854afd2ff38ca8e086?response-content-disposition=attachment%3B%20filename%2A%3DUTF-8%27%27Love.in.Disguise.S01E03.mp4&X-Amz-Signature=a%2Bb&X-Amz-Expires=900';
   assert.equal(mediaType(url), 'video/mp4');
   const payload = payloadFor({ url, type: mediaType(url), headers: {} }, '第3集', 'https://page.example/watch', '');
   assert.equal(payload.url, url);
@@ -49,15 +74,22 @@ test('ScriptCat recognizes extensionless object storage links without altering s
   assert.equal(mediaType('https://storage.example/object?response-content-type=video%2Fmp4'), 'video/mp4');
   assert.equal(mediaType('https://storage.example/object?filename=video.mp4'), 'video/mp4');
   assert.equal(mediaType('https://storage.example/object?random=video.mp4'), '');
-  assert.equal(mediaType('https://storage.example/object', '', "attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87.srt"), 'application/x-subrip');
+  assert.equal(
+    mediaType('https://storage.example/object', '', "attachment; filename*=UTF-8''%E4%B8%AD%E6%96%87.srt"),
+    'application/x-subrip'
+  );
 });
 
 test('ScriptCat recognizes audio extensions, MIME aliases and attachment names and preserves audio filenames', () => {
   const samples = [
-    ['mp3', 'audio/mpeg', 'audio/mp3'], ['m4a', 'audio/mp4', 'audio/x-m4a'],
-    ['aac', 'audio/aac', 'audio/aacp'], ['wav', 'audio/wav', 'audio/x-wav'],
-    ['flac', 'audio/flac', 'audio/x-flac'], ['ogg', 'audio/ogg', 'application/ogg'],
-    ['opus', 'audio/opus', 'audio/opus'], ['weba', 'audio/webm', 'audio/webm'],
+    ['mp3', 'audio/mpeg', 'audio/mp3'],
+    ['m4a', 'audio/mp4', 'audio/x-m4a'],
+    ['aac', 'audio/aac', 'audio/aacp'],
+    ['wav', 'audio/wav', 'audio/x-wav'],
+    ['flac', 'audio/flac', 'audio/x-flac'],
+    ['ogg', 'audio/ogg', 'application/ogg'],
+    ['opus', 'audio/opus', 'audio/opus'],
+    ['weba', 'audio/webm', 'audio/webm'],
   ];
   for (const [ext, mime, alias] of samples) {
     assert.equal(mediaType(`https://cdn.example/song.${ext}?token=a%2Bb`), mime);
@@ -84,17 +116,27 @@ test('ScriptCat observes real fetch/XHR response objects without consuming page 
       this.responseText = 'WEBVTT';
       this.listener();
     }
-    getResponseHeader() { return 'text/vtt'; }
-    addEventListener(_name, fn) { this.listener = fn; }
+    getResponseHeader() {
+      return 'text/vtt';
+    }
+    addEventListener(_name, fn) {
+      this.listener = fn;
+    }
   }
   const page = {
     XMLHttpRequest: XHR,
     fetch: async () => new Response('#EXTM3U\n#EXTINF:1,\na.ts', { headers: { 'content-type': 'text/plain' } }),
   };
   const sandbox = {
-    unsafeWindow: page, window: { top: { postMessage: value => messages.push(value) } },
-    location: new URL('https://page.example/player'), document: { referrerPolicy: '', addEventListener() {} },
-    navigator: { userAgent: 'fixture browser' }, URL, Headers, TextDecoder, setInterval() {},
+    unsafeWindow: page,
+    window: { top: { postMessage: value => messages.push(value) } },
+    location: new URL('https://page.example/player'),
+    document: { referrerPolicy: '', addEventListener() {} },
+    navigator: { userAgent: 'fixture browser' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval() {},
   };
   vm.runInNewContext(fs.readFileSync(require.resolve('../examples/scriptcat-downloader.user.js'), 'utf8'), sandbox);
   const response = await page.fetch('https://cdn.example/index.txt', { credentials: 'include', headers: { Authorization: 'signed' } });
@@ -118,9 +160,17 @@ test('ScriptCat observes real fetch/XHR response objects without consuming page 
 
 test('ScriptCat panel sends selected media only, reads target cookies on click and keeps Docker auth separate', async () => {
   class Element {
-    constructor() { this.children = []; this.style = {}; this.value = ''; }
-    append(...children) { this.children.push(...children); }
-    replaceChildren() { this.children = []; }
+    constructor() {
+      this.children = [];
+      this.style = {};
+      this.value = '';
+    }
+    append(...children) {
+      this.children.push(...children);
+    }
+    replaceChildren() {
+      this.children = [];
+    }
   }
   const fields = new Map();
   const panel = new Element();
@@ -137,17 +187,40 @@ test('ScriptCat panel sends selected media only, reads target cookies on click a
   const requests = [];
   const cookieReads = [];
   const historical = [];
-  class XHR { open() {} setRequestHeader() {} send() {} }
-  const page = { XMLHttpRequest: XHR, fetch: async () => new Response('', { headers: { 'content-type': 'application/vnd.apple.mpegurl' } }) };
+  class XHR {
+    open() {}
+    setRequestHeader() {}
+    send() {}
+  }
+  const page = {
+    XMLHttpRequest: XHR,
+    fetch: async () => new Response('', { headers: { 'content-type': 'application/vnd.apple.mpegurl' } }),
+  };
   const window = { addEventListener() {} };
   window.top = window;
   const sandbox = {
-    unsafeWindow: page, window, location: new URL('https://page.example/detail/1'),
-    document: { title: '作品名称', documentElement: new Element(), createElement: element, referrerPolicy: '', addEventListener() {}, querySelectorAll: () => [] },
-    navigator: { userAgent: 'fixture browser' }, URL, Headers, TextDecoder, setInterval() {}, setTimeout, clearTimeout,
+    unsafeWindow: page,
+    window,
+    location: new URL('https://page.example/detail/1'),
+    document: {
+      title: '作品名称',
+      documentElement: new Element(),
+      createElement: element,
+      referrerPolicy: '',
+      addEventListener() {},
+      querySelectorAll: () => [],
+    },
+    navigator: { userAgent: 'fixture browser' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval() {},
+    setTimeout,
+    clearTimeout,
     performance: { getEntriesByType: () => historical },
     GM_getValue: () => ({ server: 'https://docker.example/prefix', secret: 'docker-secret' }),
-    GM_setValue() {}, GM_registerMenuCommand() {},
+    GM_setValue() {},
+    GM_registerMenuCommand() {},
     GM_cookie(action, details, callback) {
       cookieReads.push({ action, details });
       callback([{ name: 'session', value: 'media-only', domain: 'cdn.example', path: '/', hostOnly: true, httpOnly: true }]);
@@ -205,9 +278,17 @@ test('ScriptCat panel sends selected media only, reads target cookies on click a
 
 test('ScriptCat hides floating button on configured WebUI origin and restores saved vertical offset', () => {
   class Element {
-    constructor() { this.children = []; this.style = {}; this.value = ''; }
-    append(...children) { this.children.push(...children); }
-    replaceChildren() { this.children = []; }
+    constructor() {
+      this.children = [];
+      this.style = {};
+      this.value = '';
+    }
+    append(...children) {
+      this.children.push(...children);
+    }
+    replaceChildren() {
+      this.children = [];
+    }
   }
   const fields = new Map();
   const panel = new Element();
@@ -220,15 +301,35 @@ test('ScriptCat hides floating button on configured WebUI origin and restores sa
     querySelector: () => panel,
   };
   const element = () => Object.assign(new Element(), { attachShadow: () => root });
-  class XHR { open() {} setRequestHeader() {} send() {} }
+  class XHR {
+    open() {}
+    setRequestHeader() {}
+    send() {}
+  }
   const window = { innerHeight: 800, addEventListener() {} };
   window.top = window;
   const sandbox = {
-    unsafeWindow: { XMLHttpRequest: XHR }, window, location: new URL('http://10.0.0.194:6600/'),
-    document: { title: 'M3U8', documentElement: new Element(), createElement: element, referrerPolicy: '', addEventListener() {}, querySelectorAll: () => [] },
-    navigator: { userAgent: 'fixture' }, URL, Headers, TextDecoder, setInterval() {}, setTimeout, clearTimeout,
+    unsafeWindow: { XMLHttpRequest: XHR },
+    window,
+    location: new URL('http://10.0.0.194:6600/'),
+    document: {
+      title: 'M3U8',
+      documentElement: new Element(),
+      createElement: element,
+      referrerPolicy: '',
+      addEventListener() {},
+      querySelectorAll: () => [],
+    },
+    navigator: { userAgent: 'fixture' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval() {},
+    setTimeout,
+    clearTimeout,
     GM_getValue: key => (key === 'docker-btn-bottom' ? 180 : { server: 'http://10.0.0.194:6600', secret: '123456' }),
-    GM_setValue() {}, GM_registerMenuCommand() {},
+    GM_setValue() {},
+    GM_registerMenuCommand() {},
   };
   vm.runInNewContext(fs.readFileSync(require.resolve('../examples/scriptcat-downloader.user.js'), 'utf8'), sandbox);
   assert.equal(root.getElementById('toggle').hidden, true);
@@ -237,14 +338,18 @@ test('ScriptCat hides floating button on configured WebUI origin and restores sa
 
 test('ScriptCat extracts detail titles over generic titles and parses M3U8 metadata and API errors', () => {
   const {
-    extractPageTitle, inferQualityFromUrl, formatDuration, formatBitrate, parseM3u8Meta, parseApiResponse,
+    extractPageTitle,
+    inferQualityFromUrl,
+    formatDuration,
+    formatBitrate,
+    parseM3u8Meta,
+    parseApiResponse,
   } = require('../examples/scriptcat-downloader.user.js');
 
   const ldDoc = {
     title: '播放器 - 加载中...',
-    querySelectorAll: sel => sel.includes('ld+json')
-      ? [{ textContent: JSON.stringify({ '@graph': [{ '@type': 'TVEpisode', name: '绝命毒师 S01E01' }] }) }]
-      : [],
+    querySelectorAll: sel =>
+      sel.includes('ld+json') ? [{ textContent: JSON.stringify({ '@graph': [{ '@type': 'TVEpisode', name: '绝命毒师 S01E01' }] }) }] : [],
     querySelector: sel => (sel.includes('og:title') ? { getAttribute: () => '错误兜底标题' } : null),
   };
   assert.equal(extractPageTitle(ldDoc, 'https://site.example/play/1'), '绝命毒师 S01E01');
@@ -272,42 +377,48 @@ test('ScriptCat extracts detail titles over generic titles and parses M3U8 metad
 
   assert.deepEqual(inferQualityFromUrl('https://cdn.example/vod/1080p/index.m3u8'), { height: 1080, label: '1080p', inferred: true });
   assert.deepEqual(inferQualityFromUrl('https://cdn.example/v_1920x1080.m3u8'), {
-    width: 1920, height: 1080, resolution: '1920x1080', label: '1080p', inferred: true,
+    width: 1920,
+    height: 1080,
+    resolution: '1920x1080',
+    label: '1080p',
+    inferred: true,
   });
   assert.equal(formatDuration(2108), '35:08');
   assert.equal(formatDuration(3912), '1:05:12');
   assert.equal(formatBitrate(4_500_000), '4.5 Mbps');
   assert.equal(formatBitrate(850_000), '850 kbps');
 
-  const masterMeta = parseM3u8Meta([
-    '#EXTM3U',
-    '#EXT-X-STREAM-INF:BANDWIDTH=2200000,RESOLUTION=1280x720',
-    '720p/video.m3u8',
-    '#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080',
-    'https://other.cdn/1080p/video.m3u8',
-  ].join('\n'), 'https://cdn.example/stream/master.m3u8');
+  const masterMeta = parseM3u8Meta(
+    [
+      '#EXTM3U',
+      '#EXT-X-STREAM-INF:BANDWIDTH=2200000,RESOLUTION=1280x720',
+      '720p/video.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=4500000,RESOLUTION=1920x1080',
+      'https://other.cdn/1080p/video.m3u8',
+    ].join('\n'),
+    'https://cdn.example/stream/master.m3u8'
+  );
   assert.equal(masterMeta.isMaster, true);
   assert.equal(masterMeta.variants.length, 2);
   assert.equal(masterMeta.variants[0].height, 1080);
   assert.equal(masterMeta.variants[0].url, 'https://other.cdn/1080p/video.m3u8');
   assert.equal(masterMeta.variants[1].url, 'https://cdn.example/stream/720p/video.m3u8');
 
-  const mediaMeta = parseM3u8Meta([
-    '#EXTM3U',
-    '#EXT-X-KEY:METHOD=AES-128,URI="key.key"',
-    '#EXTINF:100.4,',
-    'seg1.ts',
-    '#EXTINF:110.0,',
-    'seg2.ts',
-    '#EXT-X-ENDLIST',
-  ].join('\n'), 'https://cdn.example/720p/video.m3u8');
+  const mediaMeta = parseM3u8Meta(
+    ['#EXTM3U', '#EXT-X-KEY:METHOD=AES-128,URI="key.key"', '#EXTINF:100.4,', 'seg1.ts', '#EXTINF:110.0,', 'seg2.ts', '#EXT-X-ENDLIST'].join(
+      '\n'
+    ),
+    'https://cdn.example/720p/video.m3u8'
+  );
   assert.equal(mediaMeta.isMaster, false);
   assert.equal(mediaMeta.duration, 210);
   assert.equal(mediaMeta.segmentCount, 2);
   assert.equal(mediaMeta.encryption, 'AES-128');
 
   assert.deepEqual(parseApiResponse(200, JSON.stringify({ code: 0, data: { added: 1, skipped: 0 } })), {
-    ok: true, data: { added: 1, skipped: 0 }, message: '',
+    ok: true,
+    data: { added: 1, skipped: 0 },
+    message: '',
   });
   assert.match(parseApiResponse(401, '<html>Unauthorized</html>').message, /DS_SECRET|401/);
   assert.match(parseApiResponse(502, '<html>Bad Gateway</html>').message, /502/);
@@ -315,9 +426,19 @@ test('ScriptCat extracts detail titles over generic titles and parses M3U8 metad
 
 test('ScriptCat extracts variants without cross-origin credential leakage, filters, probes and reports send results', async () => {
   class Element {
-    constructor() { this.children = []; this.style = {}; this.value = ''; this.hidden = false; this.className = ''; }
-    append(...children) { this.children.push(...children); }
-    replaceChildren() { this.children = []; }
+    constructor() {
+      this.children = [];
+      this.style = {};
+      this.value = '';
+      this.hidden = false;
+      this.className = '';
+    }
+    append(...children) {
+      this.children.push(...children);
+    }
+    replaceChildren() {
+      this.children = [];
+    }
   }
   const fields = new Map();
   const panel = new Element();
@@ -364,7 +485,11 @@ test('ScriptCat extracts variants without cross-origin credential leakage, filte
       }
       return new Response('', { status: 200 });
     },
-    XMLHttpRequest: class XHR { open() {} setRequestHeader() {} send() {} },
+    XMLHttpRequest: class XHR {
+      open() {}
+      setRequestHeader() {}
+      send() {}
+    },
   };
   const location = { href: 'https://site.example/play/1', origin: 'https://site.example' };
   const window = { innerHeight: 844, addEventListener: (name, fn) => listeners.set(name, fn) };
@@ -379,11 +504,20 @@ test('ScriptCat extracts variants without cross-origin credential leakage, filte
     querySelectorAll: () => [],
   };
   const sandbox = {
-    unsafeWindow: page, window, location, document,
-    navigator: { userAgent: 'mobile-ua' }, URL, Headers, TextDecoder,
-    setInterval: () => 0, setTimeout, clearTimeout,
+    unsafeWindow: page,
+    window,
+    location,
+    document,
+    navigator: { userAgent: 'mobile-ua' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval: () => 0,
+    setTimeout,
+    clearTimeout,
     GM_getValue: key => (key === 'docker-settings' ? { server: 'http://docker.local:6600', secret: 'good-secret' } : null),
-    GM_setValue() {}, GM_registerMenuCommand() {},
+    GM_setValue() {},
+    GM_registerMenuCommand() {},
     GM_cookie(_action, details, cb) {
       cookieReads.push(details.url);
       cb([{ domain: new URL(details.url).hostname, path: '/', name: 'sid', value: 's1', secure: true }], null);
@@ -440,9 +574,10 @@ test('ScriptCat extracts variants without cross-origin credential leakage, filte
 
   // Explicit probe populates duration and encryption badges on 1080p variant.
   await root.getElementById('probe').onclick();
-  const findRow = suffix => root.getElementById('list').children.find(r =>
-    r.children[1].children.some(c => typeof c.textContent === 'string' && c.textContent.includes(suffix)),
-  );
+  const findRow = suffix =>
+    root
+      .getElementById('list')
+      .children.find(r => r.children[1].children.some(c => typeof c.textContent === 'string' && c.textContent.includes(suffix)));
   const hdRow = findRow('/hd/1080p.m3u8');
   assert.ok(hdRow);
   const hdBadges = hdRow.children[1].children[0].children.map(el => el.textContent);
@@ -492,9 +627,19 @@ test('ScriptCat extracts variants without cross-origin credential leakage, filte
 
 test('ScriptCat auto-hides empty floating button by default, reveals on media detection, and persists hideWhenEmpty option', async () => {
   class Element {
-    constructor() { this.children = []; this.style = {}; this.value = ''; this.hidden = false; this.className = ''; }
-    append(...children) { this.children.push(...children); }
-    replaceChildren() { this.children = []; }
+    constructor() {
+      this.children = [];
+      this.style = {};
+      this.value = '';
+      this.hidden = false;
+      this.className = '';
+    }
+    append(...children) {
+      this.children.push(...children);
+    }
+    replaceChildren() {
+      this.children = [];
+    }
   }
   const createSandbox = (pageUrl, initialStore) => {
     const fields = new Map();
@@ -511,8 +656,13 @@ test('ScriptCat auto-hides empty floating button by default, reveals on media de
     let stored = initialStore;
     const savedCalls = [];
     const page = {
-      fetch: async () => new Response('#EXTM3U\n#EXTINF:5,\nseg.ts', { status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } }),
-      XMLHttpRequest: class XHR { open() {} setRequestHeader() {} send() {} },
+      fetch: async () =>
+        new Response('#EXTM3U\n#EXTINF:5,\nseg.ts', { status: 200, headers: { 'Content-Type': 'application/vnd.apple.mpegurl' } }),
+      XMLHttpRequest: class XHR {
+        open() {}
+        setRequestHeader() {}
+        send() {}
+      },
     };
     const window = { innerHeight: 844, addEventListener() {} };
     window.top = window;
@@ -543,7 +693,9 @@ test('ScriptCat auto-hides empty floating button by default, reveals on media de
           savedCalls.push(val);
         }
       },
-      GM_registerMenuCommand: (_name, fn) => { menuCallback = fn; },
+      GM_registerMenuCommand: (_name, fn) => {
+        menuCallback = fn;
+      },
     };
     vm.runInNewContext(fs.readFileSync(require.resolve('../examples/scriptcat-downloader.user.js'), 'utf8'), sandbox);
     return { root, panel, page, getMenu: () => menuCallback, getStored: () => stored, savedCalls };
@@ -589,4 +741,252 @@ test('ScriptCat auto-hides empty floating button by default, reveals on media de
   await webui.page.fetch('https://cdn.example/video.m3u8');
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(webui.root.getElementById('toggle').hidden, true);
+});
+
+test('ScriptCat extracts player tokenSession, updates URLs on token refresh, and attaches tokenSession only to HLS payloads', async () => {
+  const inlineHtml = `
+    <script>
+      createPlayer({
+        cloudType: 0,
+        movieId: "movie-42",
+        sessionId: "sess-xyz",
+        guidId: "guid-77",
+        apiSecret: "sec-key",
+        apiSecretIssuedAt: 1795800000,
+        timeDiff: 12000
+      });
+    </script>
+  `;
+  const session = extractTokenSessionFromText(inlineHtml, 'https://player.example/player/v2?id=42');
+  assert.deepEqual(session, {
+    origin: 'https://player.example',
+    playerUrl: 'https://player.example/player/v2?id=42',
+    sessionId: 'sess-xyz',
+    movieId: 'movie-42',
+    guidId: 'guid-77',
+    apiSecret: 'sec-key',
+    apiSecretIssuedAt: 1795800000,
+    timeDiffMs: 12000,
+  });
+  assert.equal(extractTokenSessionFromText('<div>no player</div>', 'https://player.example/v'), null);
+
+  const oldM3u8 = 'https://cdn.example/20261126/vid-1/1080p/video.m3u8?token=old&expires=100&token_path=%252Fvid-1%252F&vid=v1';
+  const refreshedM3u8 = applyFreshTokenToUrl(oldM3u8, 'fresh-tok', 1999999999, '%252Fvid-1%252F', 'v2');
+  const refreshedUrl = new URL(refreshedM3u8);
+  assert.equal(refreshedUrl.searchParams.get('token'), 'fresh-tok');
+  assert.equal(refreshedUrl.searchParams.get('expires'), '1999999999');
+  assert.equal(refreshedUrl.searchParams.get('token_path'), '/vid-1/');
+  assert.equal(refreshedUrl.searchParams.get('vid'), 'v2');
+  assert.ok(!refreshedM3u8.includes('%252F'));
+
+  const unrelated = 'https://cdn.example/other/playlist.m3u8';
+  assert.equal(applyFreshTokenToUrl(unrelated, 'fresh-tok', 1999999999, '/vid-1/'), unrelated);
+
+  const hlsPayload = payloadFor(
+    { url: refreshedM3u8, type: 'application/vnd.apple.mpegurl', headers: {}, tokenSession: session },
+    'Demo Title',
+    'https://player.example/movie/detail/42.html',
+    ''
+  );
+  assert.deepEqual(hlsPayload.tokenSession, session);
+
+  const subPayload = payloadFor(
+    { url: 'https://sub.example/zh.vtt', type: 'text/vtt', headers: {}, tokenSession: session },
+    'Demo Title',
+    'https://player.example/movie/detail/42.html',
+    ''
+  );
+  assert.equal(subPayload.tokenSession, undefined);
+
+  // Runtime: iframe script extraction + /api/token/generate live refresh updates resource & preserves selection
+  class Element {
+    constructor() {
+      this.children = [];
+      this.style = {};
+      this.value = '';
+      this.hidden = false;
+      this.className = '';
+    }
+    append(...children) {
+      this.children.push(...children);
+    }
+    replaceChildren() {
+      this.children = [];
+    }
+  }
+  const fields = new Map();
+  const panel = new Element();
+  panel.hidden = true;
+  const root = {
+    getElementById(id) {
+      if (!fields.has(id)) fields.set(id, new Element());
+      return fields.get(id);
+    },
+    querySelector: () => panel,
+  };
+  const posted = [];
+  const page = {
+    fetch: async url => {
+      const u = String(url);
+      if (u.endsWith('/api/token/generate')) {
+        return new Response(
+          JSON.stringify({
+            data: { token: 'new-live-tok', expires: 1999999888, tokenPath: '%2Fvid-9%2F', vid: 'v9b' },
+          }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      return new Response('#EXTM3U\n#EXTINF:5,\nvideo0.ts\n#EXT-X-ENDLIST\n', {
+        status: 200,
+        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+      });
+    },
+    XMLHttpRequest: class XHR {
+      open() {}
+      setRequestHeader() {}
+      send() {}
+    },
+  };
+  const window = {
+    innerHeight: 844,
+    addEventListener() {},
+    top: { postMessage: msg => posted.push(msg) },
+  };
+  const iframeSandbox = {
+    unsafeWindow: page,
+    window,
+    location: new URL('https://player.example/player/v2?payload=abc'),
+    document: {
+      title: 'Player',
+      documentElement: new Element(),
+      createElement: () => Object.assign(new Element(), { attachShadow: () => root }),
+      referrerPolicy: '',
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: sel => (sel === 'script' ? [{ textContent: inlineHtml }] : []),
+    },
+    navigator: { userAgent: 'ua' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval: () => 0,
+    setTimeout,
+    clearTimeout,
+    GM_getValue: () => null,
+    GM_setValue() {},
+    GM_registerMenuCommand() {},
+  };
+  vm.runInNewContext(fs.readFileSync(require.resolve('../examples/scriptcat-downloader.user.js'), 'utf8'), iframeSandbox);
+  await page.fetch('https://cdn.example/20261126/vid-9/1080p/video.m3u8?token=old-tok&expires=100&token_path=%2Fvid-9%2F&vid=v9');
+  await page.fetch('https://player.example/api/token/generate', { method: 'POST', body: '{}' });
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  const tokenSessMsg = posted.find(m => m.kind === 'm3u8-dl-token-session-v1');
+  assert.ok(tokenSessMsg);
+  assert.equal(tokenSessMsg.tokenSession.movieId, 'movie-42');
+  const itemMsg = posted.find(m => m.kind === 'm3u8-dl-resource-v1');
+  assert.ok(itemMsg);
+  assert.equal(itemMsg.item.tokenSession.sessionId, 'sess-xyz');
+  const refreshMsg = posted.find(m => m.kind === 'm3u8-dl-token-refresh-v1');
+  assert.ok(refreshMsg);
+  assert.equal(refreshMsg.token, 'new-live-tok');
+
+  // Dynamic createPlayer hook capture without any inline <script> tag + isolated player/media cookies
+  const hookPosted = [];
+  const hookSent = [];
+  const hookFields = new Map();
+  const hookPanel = new Element();
+  hookPanel.hidden = true;
+  const hookRoot = {
+    getElementById(id) {
+      if (!hookFields.has(id)) hookFields.set(id, new Element());
+      return hookFields.get(id);
+    },
+    querySelector: () => hookPanel,
+  };
+  const hookPage = {
+    fetch: async () =>
+      new Response('#EXTM3U\n#EXTINF:5,\nvideo0.ts\n#EXT-X-ENDLIST\n', {
+        status: 200,
+        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+      }),
+    XMLHttpRequest: class XHR {
+      open() {}
+      setRequestHeader() {}
+      send() {}
+    },
+  };
+  const hookSandbox = {
+    unsafeWindow: hookPage,
+    window: {
+      innerHeight: 844,
+      addEventListener() {},
+      top: { postMessage: msg => hookPosted.push(msg) },
+    },
+    location: new URL('https://player.example/player/v2?payload=dyn'),
+    document: {
+      title: 'Dynamic Player',
+      documentElement: new Element(),
+      createElement: () => Object.assign(new Element(), { attachShadow: () => hookRoot }),
+      referrerPolicy: '',
+      addEventListener() {},
+      querySelector: () => null,
+      querySelectorAll: () => [],
+    },
+    navigator: { userAgent: 'ua' },
+    URL,
+    Headers,
+    TextDecoder,
+    setInterval: () => 0,
+    setTimeout,
+    clearTimeout,
+    GM_getValue: key => (key === 'docker-settings' ? { server: 'http://docker.local:6600', secret: 'sec' } : null),
+    GM_setValue() {},
+    GM_registerMenuCommand() {},
+    GM_cookie(_action, details, cb) {
+      if (details.url.includes('player.example')) {
+        cb([{ domain: 'player.example', path: '/', name: 'cf_clearance', value: 'p1', secure: true }], null);
+      } else {
+        cb([{ domain: 'cdn.example', path: '/', name: 'cdn_sid', value: 'c1', secure: true }], null);
+      }
+    },
+    GM_xmlhttpRequest(opts) {
+      hookSent.push(opts);
+      opts.onload({ status: 200, responseText: JSON.stringify({ code: 0, data: { added: 1, skipped: 0 } }) });
+    },
+  };
+  hookSandbox.window.top = hookSandbox.window;
+  vm.runInNewContext(fs.readFileSync(require.resolve('../examples/scriptcat-downloader.user.js'), 'utf8'), hookSandbox);
+  let playerInitCalled = false;
+  hookPage.createPlayer = opts => ({
+    init() {
+      playerInitCalled = Boolean(opts.movieId);
+    },
+  });
+  hookPage
+    .createPlayer({
+      cloudType: 0,
+      movieId: 'dyn-movie',
+      sessionId: 'dyn-sess',
+      guidId: 'dyn-guid',
+      apiSecret: 'dyn-secret',
+      apiSecretIssuedAt: 1795800999,
+      timeDiff: 0,
+    })
+    .init();
+  assert.equal(playerInitCalled, true);
+
+  await hookPage.fetch('https://cdn.example/20261126/dyn-1/1080p/video.m3u8?token=t0&expires=1999999000&token_path=%2Fdyn-1%2F&vid=d1', {
+    credentials: 'include',
+  });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  hookRoot.getElementById('toggle').onclick();
+  hookRoot.getElementById('cookies').checked = true;
+  hookRoot.getElementById('all').onclick();
+  await hookRoot.getElementById('send').onclick();
+  assert.equal(hookSent.length, 1);
+  const sentPayload = JSON.parse(hookSent[0].data).data[0];
+  assert.equal(sentPayload.tokenSession.movieId, 'dyn-movie');
+  assert.equal(sentPayload.tokenSession.cookie, 'cf_clearance=p1');
+  assert.equal(sentPayload.requestHeaders.cookie, 'cdn_sid=c1');
 });

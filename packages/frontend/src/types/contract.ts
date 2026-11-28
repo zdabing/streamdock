@@ -52,6 +52,18 @@ export interface TaskScrapeMeta {
   downloadImages?: boolean;
   overwriteNfo?: boolean;
 }
+export interface HlsTokenSession {
+  origin: string;
+  playerUrl: string;
+  baseSignedUrl?: string;
+  sessionId: string;
+  movieId: string;
+  guidId?: string;
+  apiSecret: string;
+  apiSecretIssuedAt?: string | number;
+  timeDiffMs?: number;
+  cookie?: string;
+}
 export interface TaskOptions {
   useDefaultHeaders?: boolean;
   type?: 'auto' | 'm3u8' | 'file' | 'parser';
@@ -61,6 +73,7 @@ export interface TaskOptions {
   saveDir?: string;
   ignoreSegments?: string;
   headers?: string | Record<string, string | string[] | number | undefined>;
+  tokenSession?: HlsTokenSession;
   scrapeMeta?: TaskScrapeMeta;
 }
 export interface TaskItem extends DownloadStats {

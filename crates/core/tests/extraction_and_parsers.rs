@@ -4,15 +4,19 @@ use std::sync::{Arc, Mutex};
 use axum::Router;
 use axum::http::{HeaderMap as AxHeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use streamdock_core::cat_catch::cat_catch_tasks;
-use streamdock_core::contract::{DownloadTypeKind, HeaderMap};
+use streamdock_core::contract::{
+    DownloadExecOptions, DownloadTypeKind, HeaderInput, HeaderMap, HlsTokenSession, InputTypeKind,
+};
+use streamdock_core::download::download_resource;
 use streamdock_core::extractor::{ExtractMediaOptions, decode_page_text, extract_media};
 use streamdock_core::http::decode_b64_utf8;
+use streamdock_core::m3u8_parse::parse_m3u8;
 use streamdock_core::signed_hls_proxy::{RefreshFn, SignedHlsProxy};
 use streamdock_core::video_parser::VideoParser;
 use streamdock_core::video_parser::request::{PageData, ParserContext};
@@ -772,4 +776,266 @@ async fn signed_hls_proxy_supports_date_prefix_no_double_encode_and_bcdn_path_to
 
     proxy_b.close().await;
     srv_b.abort();
+}
+
+#[tokio::test]
+async fn m3u8_parse_inherits_signed_query_params_and_skips_cross_origin() {
+    let app = Router::new()
+        .route(
+            "/20261126/vid1/playlist.m3u8",
+            get(|uri: axum::http::Uri| async move {
+                let q = uri.query().unwrap_or("");
+                assert!(q.contains("token=tokA"), "master query missing: {q}");
+                "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3000000\n1080p/video.m3u8\n"
+            }),
+        )
+        .route(
+            "/20261126/vid1/1080p/video.m3u8",
+            get(|uri: axum::http::Uri| async move {
+                let q = uri.query().unwrap_or("");
+                assert!(q.contains("token=tokA"), "sub-playlist missing token: {q}");
+                assert!(q.contains("vid=v1"), "sub-playlist missing vid: {q}");
+                assert!(
+                    q.contains("token_path=%2Fvid1%2F"),
+                    "sub-playlist token_path not normalized: {q}"
+                );
+                "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"../enc.key\"\n#EXTINF:2,\nseg0.ts\n#EXTINF:2,\nhttps://other.example/seg1.ts\n#EXT-X-ENDLIST\n"
+            }),
+        )
+        .route(
+            "/20261126/vid1/enc.key",
+            get(|uri: axum::http::Uri| async move {
+                let q = uri.query().unwrap_or("");
+                assert!(q.contains("token=tokA"), "key missing token: {q}");
+                assert!(
+                    q.contains("token_path=%2Fvid1%2F"),
+                    "key token_path missing: {q}"
+                );
+                b"1234567890abcdef".to_vec()
+            }),
+        );
+
+    let (port, srv) = spawn_test_router(app).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let master = format!(
+        "http://127.0.0.1:{port}/20261126/vid1/playlist.m3u8?token=tokA&expires=1999999999&token_path=%252Fvid1%252F&vid=v1"
+    );
+    let client = streamdock_core::http::default_http_client().clone();
+    let info = parse_m3u8(
+        &client,
+        &master,
+        tmp.path(),
+        &HeaderMap::new(),
+        &CancellationToken::new(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(info.data.len(), 2);
+    assert!(info.data[0].uri.contains("token=tokA"));
+    assert!(info.data[0].uri.contains("token_path=%2Fvid1%2F"));
+    assert!(!info.data[0].uri.contains("%252F"));
+    assert_eq!(info.data[1].uri, "https://other.example/seg1.ts");
+    srv.abort();
+}
+
+#[tokio::test]
+async fn cat_catch_token_session_and_download_resource_auto_refresh_expired_hls() {
+    let refresh_calls = Arc::new(AtomicUsize::new(0));
+    let seen_seg_tokens = Arc::new(Mutex::new(Vec::<String>::new()));
+    let port_slot = Arc::new(Mutex::new(0u16));
+
+    let rc = refresh_calls.clone();
+    let seg_toks = seen_seg_tokens.clone();
+    let p_slot = port_slot.clone();
+
+    let token_seen_cookies = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let seg_seen_cookies = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let token_cookies_hook = token_seen_cookies.clone();
+    let seg_cookies_hook = seg_seen_cookies.clone();
+
+    let app = Router::new()
+        .route(
+            "/api/token/generate",
+            post(
+                move |hdrs: AxHeaderMap, axum::Json(body): axum::Json<serde_json::Value>| {
+                    let rc = rc.clone();
+                    let tc = token_cookies_hook.clone();
+                    async move {
+                        rc.fetch_add(1, Ordering::SeqCst);
+                        let cookie = hdrs
+                            .get("cookie")
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_string);
+                        tc.lock().unwrap().push(cookie);
+                        assert_eq!(body["movieId"], "mov-9");
+                        assert_eq!(body["sessionId"], "sess-9");
+                        assert_eq!(body["guidId"], "guid-9");
+                        assert!(body["signature"].as_str().unwrap_or("").len() == 44);
+                        axum::Json(json!({
+                            "data": {
+                                "token": "fresh-tok",
+                                "expires": 1999999999,
+                                "tokenPath": "%2Fvid9%2F",
+                                "vid": "v9"
+                            }
+                        }))
+                    }
+                },
+            ),
+        )
+        .route(
+            "/20261126/vid9/1080p/video.m3u8",
+            get(|uri: axum::http::Uri| async move {
+                let q = uri.query().unwrap_or("");
+                if !q.contains("token=fresh-tok") {
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("expired"))
+                        .unwrap();
+                }
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .body(axum::body::Body::from(
+                        "#EXTM3U\n#EXTINF:1,\nvideo0.ts\n#EXT-X-ENDLIST\n",
+                    ))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/20261126/vid9/1080p/video0.ts",
+            get(move |hdrs: AxHeaderMap, uri: axum::http::Uri| {
+                let seg_toks = seg_toks.clone();
+                let sc = seg_cookies_hook.clone();
+                let _ = &p_slot;
+                async move {
+                    let q = uri.query().unwrap_or("").to_string();
+                    seg_toks.lock().unwrap().push(q.clone());
+                    let cookie = hdrs
+                        .get("cookie")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    sc.lock().unwrap().push(cookie);
+                    if !q.contains("token=fresh-tok") || !q.contains("vid=v9") {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .body(axum::body::Body::from("expired seg"))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(axum::body::Body::from(b"ts-payload".to_vec()))
+                        .unwrap()
+                }
+            }),
+        );
+
+    let (port, srv) = spawn_test_router(app).await;
+    *port_slot.lock().unwrap() = port;
+
+    let expired_m3u8 = format!(
+        "http://127.0.0.1:{port}/20261126/vid9/1080p/video.m3u8?token=expired-tok&expires=100&token_path=%2Fvid9%2F&vid=v9"
+    );
+    let payload = json!({
+        "action": "catch",
+        "data": [
+            {
+                "url": expired_m3u8,
+                "name": "Token Session Movie.mp4",
+                "type": "application/vnd.apple.mpegurl",
+                "sourceUrl": format!("http://127.0.0.1:{port}/movie/9.html"),
+                "tokenSession": {
+                    "origin": format!("http://127.0.0.1:{port}"),
+                    "playerUrl": format!("http://127.0.0.1:{port}/player/v2?id=9"),
+                    "sessionId": "sess-9",
+                    "movieId": "mov-9",
+                    "guidId": "guid-9",
+                    "apiSecret": "sec-9",
+                    "apiSecretIssuedAt": 1795800000,
+                    "timeDiffMs": 0,
+                    "cookie": "cf_clearance=demo"
+                }
+            },
+            {
+                "url": format!("http://127.0.0.1:{port}/sub.vtt"),
+                "name": "Sub.vtt",
+                "type": "text/vtt",
+                "tokenSession": {
+                    "origin": format!("http://127.0.0.1:{port}"),
+                    "playerUrl": format!("http://127.0.0.1:{port}/player/v2?id=9"),
+                    "sessionId": "sess-9",
+                    "movieId": "mov-9",
+                    "apiSecret": "sec-9"
+                }
+            }
+        ]
+    });
+
+    let tasks = cat_catch_tasks(&payload).unwrap();
+    assert_eq!(tasks.len(), 2);
+    let parsed_sess = tasks[0]
+        .options
+        .token_session
+        .clone()
+        .expect("HLS task should keep tokenSession");
+    assert_eq!(parsed_sess.base_signed_url, expired_m3u8);
+    assert_eq!(parsed_sess.cookie.as_deref(), Some("cf_clearance=demo"));
+    assert!(
+        tasks[1].options.token_session.is_none(),
+        "subtitle task must ignore tokenSession"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let save_dir = tmp.path().join("dl");
+    let cache_dir = tmp.path().join("cache");
+    let mut media_hdrs = serde_json::Map::new();
+    media_hdrs.insert(
+        "cookie".to_string(),
+        serde_json::Value::String("cdn=media1".to_string()),
+    );
+    let opts = DownloadExecOptions {
+        download_type: Some(InputTypeKind::M3u8),
+        filename: tasks[0].options.filename.clone(),
+        save_dir: Some(save_dir.to_string_lossy().to_string()),
+        cache_dir: Some(cache_dir.to_string_lossy().to_string()),
+        convert: Some(false),
+        headers: Some(HeaderInput::Map(media_hdrs.into_iter().collect())),
+        token_session: Some(HlsTokenSession {
+            base_signed_url: expired_m3u8.clone(),
+            ..parsed_sess
+        }),
+        ..Default::default()
+    };
+
+    let res = download_resource(&expired_m3u8, &opts, CancellationToken::new())
+        .await
+        .unwrap();
+    assert!(res.errmsg.is_none(), "unexpected error: {:?}", res.errmsg);
+    assert_eq!(res.stats.ts_success, Some(1));
+    assert!(refresh_calls.load(Ordering::SeqCst) >= 1);
+    let tok_cookies = token_seen_cookies.lock().unwrap();
+    assert!(!tok_cookies.is_empty());
+    assert!(
+        tok_cookies
+            .iter()
+            .all(|c| c.as_deref() == Some("cf_clearance=demo")),
+        "token endpoint should only get session cookie: {tok_cookies:?}"
+    );
+    let seg_cookies = seg_seen_cookies.lock().unwrap();
+    assert!(!seg_cookies.is_empty());
+    assert!(
+        seg_cookies
+            .iter()
+            .all(|c| c.as_deref() == Some("cdn=media1")),
+        "segment should keep media cookie without site cookie leak: {seg_cookies:?}"
+    );
+    let segs = seen_seg_tokens.lock().unwrap();
+    assert!(!segs.is_empty());
+    assert!(
+        segs.iter()
+            .all(|q| q.contains("token=fresh-tok") && q.contains("vid=v9"))
+    );
+
+    srv.abort();
 }

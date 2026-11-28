@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         StreamDock · 发送到下载器
 // @namespace    streamdock
-// @version      1.2.3
-// @description  智能识别详情页名称、M3U8 分辨率/时长/加密与字幕，无媒体时默认自动隐藏悬浮按钮
+// @version      1.2.4
+// @description  智能识别详情页名称、M3U8 分辨率/时长/加密、播放器令牌会话与字幕，无媒体时默认自动隐藏悬浮按钮
 // @match        http://*/*
 // @match        https://*/*
 // @run-at       document-start
@@ -315,19 +315,155 @@
     if (status >= 200 && status < 300) return { ok: false, message: '下载器返回了非 JSON 响应，请检查服务器地址是否指向下载器端口' };
     return { ok: false, message: `请求失败 (HTTP ${status || '未知'})` };
   }
+  function findCreatePlayerBlock(text) {
+    const match = /\bcreatePlayer\s*\(\s*\{/i.exec(String(text || ''));
+    if (!match) return '';
+    const start = match.index + match[0].length - 1;
+    const rest = text.slice(start);
+    let depth = 0;
+    let quote = '';
+    let escaped = false;
+    for (let i = 0; i < rest.length; i += 1) {
+      const ch = rest[i];
+      if (quote) {
+        if (escaped) escaped = false;
+        else if (ch === '\\') escaped = true;
+        else if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        quote = ch;
+      } else if (ch === '{') {
+        depth += 1;
+      } else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) return rest.slice(0, i + 1);
+      }
+    }
+    return '';
+  }
+  function extractJsScalarField(block, name) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?:^|[{\\s,])(?:["']?${escaped}["']?)\\s*:\\s*(?:"([^"\\r\\n\\\\]*(?:\\\\.[^"\\r\\n\\\\]*)*)"|'([^'\\r\\n\\\\]*(?:\\\\.[^'\\r\\n\\\\]*)*)'|(-?\\d+(?:\\.\\d+)?))`, 'm');
+    const m = re.exec(block);
+    if (!m) return undefined;
+    if (m[1] !== undefined) return m[1].replace(/\\\//g, '/');
+    if (m[2] !== undefined) return m[2].replace(/\\\//g, '/');
+    if (m[3] !== undefined) {
+      const n = Number(m[3]);
+      return Number.isFinite(n) ? n : m[3];
+    }
+    return undefined;
+  }
+  function normalizeTokenSessionObject(options, pageHref = '') {
+    if (!options || typeof options !== 'object' || Array.isArray(options)) return null;
+    const playerUrl = httpUrl(pageHref);
+    if (!playerUrl) return null;
+    const readStr = key => {
+      const val = options[key];
+      if (typeof val === 'string') return val.replace(/\\\//g, '/').trim();
+      if (typeof val === 'number' && Number.isFinite(val)) return String(val);
+      return '';
+    };
+    const movieId = readStr('movieId');
+    const sessionId = readStr('sessionId');
+    const apiSecret = readStr('apiSecret');
+    if (!movieId || !sessionId || !apiSecret) return null;
+    const guidId = readStr('guidId');
+    const issuedRaw = options.apiSecretIssuedAt;
+    const timeDiffRaw = Number(options.timeDiff);
+    const session = {
+      origin: new URL(playerUrl).origin,
+      playerUrl,
+      sessionId,
+      movieId,
+      guidId,
+      apiSecret,
+      timeDiffMs: Number.isFinite(timeDiffRaw) ? Math.trunc(timeDiffRaw) : 0,
+    };
+    if (issuedRaw !== undefined && issuedRaw !== null && issuedRaw !== '') {
+      session.apiSecretIssuedAt = issuedRaw;
+    }
+    return session;
+  }
+  function extractTokenSessionFromText(text, pageHref = '') {
+    if (!httpUrl(pageHref)) return null;
+    const block = findCreatePlayerBlock(text);
+    if (!block) return null;
+    let parsedObj = null;
+    try {
+      const candidate = JSON.parse(block);
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate)) parsedObj = candidate;
+    } catch { parsedObj = null; }
+    if (!parsedObj) {
+      parsedObj = {};
+      for (const key of ['movieId', 'sessionId', 'guidId', 'apiSecret', 'apiSecretIssuedAt', 'timeDiff']) {
+        const val = extractJsScalarField(block, key);
+        if (val !== undefined) parsedObj[key] = val;
+      }
+    }
+    return normalizeTokenSessionObject(parsedObj, pageHref);
+  }
+  function normalizeTokenPathValue(raw) {
+    let out = String(raw || '').trim();
+    for (let i = 0; i < 2; i += 1) {
+      if (/^%(?:2f|252f)/i.test(out)) {
+        try { out = decodeURIComponent(out); } catch { break; }
+      } else {
+        break;
+      }
+    }
+    return out;
+  }
+  function isSignedHlsCandidate(rawUrl) {
+    try {
+      const parsed = new URL(rawUrl);
+      if (parsed.pathname.includes('/bcdn_token=')) return true;
+      return Boolean(parsed.searchParams.get('token') && parsed.searchParams.get('expires'));
+    } catch { return false; }
+  }
+  function applyFreshTokenToUrl(rawUrl, token, expires, tokenPath = '', vid = '') {
+    const cleanUrl = httpUrl(rawUrl);
+    const cleanToken = String(token || '').trim();
+    if (!cleanUrl || !cleanToken) return rawUrl;
+    const parsed = new URL(cleanUrl);
+    const hasQueryAuth = Boolean(parsed.searchParams.get('token') && parsed.searchParams.get('expires'));
+    const normPath = normalizeTokenPathValue(tokenPath);
+    const matchesTokenPath = Boolean(
+      normPath && (
+        parsed.pathname.startsWith(normPath) ||
+        /^\/\d{8}(\/.*)$/.test(parsed.pathname) && parsed.pathname.slice(9).startsWith(normPath)
+      ),
+    );
+    if (!hasQueryAuth && !matchesTokenPath) return rawUrl;
+    parsed.searchParams.set('token', cleanToken);
+    if (expires !== undefined && expires !== null && String(expires).trim()) {
+      parsed.searchParams.set('expires', String(expires).trim());
+    }
+    if (normPath) parsed.searchParams.set('token_path', normPath);
+    if (vid !== undefined && vid !== null && String(vid).trim()) {
+      parsed.searchParams.set('vid', String(vid).trim());
+    }
+    return parsed.href;
+  }
   function payloadFor(item, title, sourceUrl, cookies) {
     const requestHeaders = cleanHeaders(item.headers);
     if (cookies) requestHeaders.cookie = cookies;
     const ext = `.${fileFormats.find(format => format.mime === item.type)?.ext || 'mp4'}`;
     const stem = (title.trim() || '视频').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 100);
     const suffix = ['.vtt', '.srt', '.ass', '.ssa'].includes(ext) ? `.${new URL(item.url).pathname.split('/').pop().replace(/\.[^.]+$/, '').slice(0, 36) || '字幕'}` : '';
-    return { url: item.url, type: item.type, name: `${stem}${suffix}${ext}`, sourceUrl, requestHeaders };
+    const payload = { url: item.url, type: item.type, name: `${stem}${suffix}${ext}`, sourceUrl, requestHeaders };
+    if (item.tokenSession && String(item.type || '').includes('mpegurl')) {
+      payload.tokenSession = item.tokenSession;
+    }
+    return payload;
   }
   // Also usable by the repository's Node tests without a browser or extension.
   if (typeof module === 'object' && module.exports) {
     module.exports = {
       httpUrl, mediaType, cleanHeaders, scopedHeaders, referrerFor, cookieHeader, payloadFor,
       extractPageTitle, inferQualityFromUrl, formatDuration, formatBitrate, parseM3u8Meta, parseApiResponse,
+      normalizeTokenSessionObject, extractTokenSessionFromText, applyFreshTokenToUrl,
     };
     return;
   }
@@ -336,8 +472,72 @@
   const resources = new Map();
   const variantHints = new Map();
   const messageKind = 'm3u8-dl-resource-v1';
+  const tokenSessionMessageKind = 'm3u8-dl-token-session-v1';
+  const tokenRefreshMessageKind = 'm3u8-dl-token-refresh-v1';
   const maxPlaylistBytes = 65536;
+  let capturedTokenSession = null;
+  let capturedTokenSessionKey = '';
   let render = () => {};
+  function publishTokenSession(session, forcePost = false) {
+    if (!session) return null;
+    const key = JSON.stringify(session);
+    const changed = key !== capturedTokenSessionKey;
+    if (changed) {
+      capturedTokenSession = session;
+      capturedTokenSessionKey = key;
+      let backfilled = false;
+      for (const [resKey, item] of resources.entries()) {
+        if (!item.tokenSession && String(item.type || '').includes('mpegurl') && isSignedHlsCandidate(item.url)) {
+          resources.set(resKey, { ...item, tokenSession: session });
+          backfilled = true;
+        }
+      }
+      if (backfilled) render();
+    }
+    if ((changed || forcePost) && window !== window.top) {
+      window.top.postMessage({ kind: tokenSessionMessageKind, tokenSession: session }, '*');
+    }
+    return capturedTokenSession;
+  }
+  function captureCreatePlayerOptions(options) {
+    try {
+      const found = normalizeTokenSessionObject(options, typeof location !== 'undefined' ? location.href : '');
+      if (found) publishTokenSession(found, true);
+    } catch { /* Never interrupt site createPlayer execution. */ }
+  }
+  function installCreatePlayerHook() {
+    if (!page || (typeof page !== 'object' && typeof page !== 'function')) return;
+    try {
+      const wrapCreatePlayer = fn => {
+        if (typeof fn !== 'function' || fn.__streamdockWrapped) return fn;
+        const wrapped = function (...args) {
+          captureCreatePlayerOptions(args[0]);
+          return fn.apply(this, args);
+        };
+        try {
+          Object.defineProperty(wrapped, '__streamdockWrapped', { value: true, configurable: true });
+        } catch { /* Ignore metadata tagging failure on frozen/proxy wrappers. */ }
+        return wrapped;
+      };
+      let currentFn = typeof page.createPlayer === 'function' ? wrapCreatePlayer(page.createPlayer) : page.createPlayer;
+      const desc = Object.getOwnPropertyDescriptor(page, 'createPlayer');
+      if (desc && desc.configurable === false) {
+        if (typeof page.createPlayer === 'function') page.createPlayer = currentFn;
+        return;
+      }
+      Object.defineProperty(page, 'createPlayer', {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return currentFn;
+        },
+        set(nextFn) {
+          currentFn = typeof nextFn === 'function' ? wrapCreatePlayer(nextFn) : nextFn;
+        },
+      });
+    } catch { /* Ignore non-configurable global createPlayer properties. */ }
+  }
+  installCreatePlayerHook();
   function mergeMeta(prev, next, url, type) {
     const merged = { ...prev, ...next };
     if (next && !next.inferred && (next.resolution || next.height || next.label)) delete merged.inferred;
@@ -351,19 +551,46 @@
     }
     return Object.keys(merged).length ? merged : undefined;
   }
+  function scanTokenSession() {
+    if (capturedTokenSession) {
+      if (window !== window.top) {
+        window.top.postMessage({ kind: tokenSessionMessageKind, tokenSession: capturedTokenSession }, '*');
+      }
+      return capturedTokenSession;
+    }
+    if (typeof document === 'undefined' || typeof document.querySelectorAll !== 'function') return capturedTokenSession;
+    try {
+      for (const scriptEl of document.querySelectorAll('script')) {
+        const src = scriptEl?.getAttribute?.('src') || scriptEl?.src || '';
+        if (src) continue;
+        const text = scriptEl?.textContent || '';
+        if (!text || !text.includes('createPlayer')) continue;
+        const found = extractTokenSessionFromText(text, typeof location !== 'undefined' ? location.href : '');
+        if (found) return publishTokenSession(found, true);
+      }
+    } catch { /* Ignore DOM script inspection errors in mocks. */ }
+    return capturedTokenSession;
+  }
+  function attachTokenSessionIfEligible(item) {
+    if (!item || !String(item.type || '').includes('mpegurl')) return item;
+    if (item.tokenSession || !capturedTokenSession || !isSignedHlsCandidate(item.url)) return item;
+    return { ...item, tokenSession: capturedTokenSession };
+  }
   function record(value, mime = '', headers = {}, cookiesAllowed = true, meta = null) {
     const url = httpUrl(value, location.href);
     if (!url) return;
     const hint = variantHints.get(url);
     const type = mediaType(url, mime) || (hint ? 'application/vnd.apple.mpegurl' : '');
     if (!type) return;
+    scanTokenSession();
     const previous = resources.get(url);
     const captured = cleanHeaders(headers);
     const hasCaptured = Object.keys(captured).length > 0;
     const hasNewMeta = Boolean(meta && Object.keys(meta).length);
     const fromMaster = Boolean(meta?.fromMaster);
+    const tokenSession = previous?.tokenSession || ((type.includes('mpegurl') && capturedTokenSession && isSignedHlsCandidate(url)) ? capturedTokenSession : undefined);
     // DOM/performance sightings must not replace the more accurate request context unless upgrading metadata.
-    if (previous && !hasCaptured && !hasNewMeta) return;
+    if (previous && !hasCaptured && !hasNewMeta && Boolean(previous.tokenSession) === Boolean(tokenSession)) return;
     if (!previous && resources.size >= 200) return;
     const mergedMeta = mergeMeta(previous?.meta, meta, url, type);
     const mergedCookiesAllowed = !previous
@@ -384,6 +611,7 @@
       cookiesAllowed: mergedCookiesAllowed,
       headers: mergedHeaders,
       ...(mergedMeta ? { meta: mergedMeta } : {}),
+      ...(tokenSession ? { tokenSession } : {}),
     };
     resources.set(url, item);
     if (window !== window.top) window.top.postMessage({ kind: messageKind, item }, '*');
@@ -453,6 +681,52 @@
     if (typeof cloned.text === 'function') return String(await cloned.text()).slice(0, limit);
     return '';
   }
+  let updateSelectionKey = () => {};
+  function refreshResourcesWithToken(info) {
+    const token = String(info?.token || '').trim();
+    const expires = info?.expires;
+    const tokenPath = info?.tokenPath || info?.token_path || '';
+    const vid = info?.vid || '';
+    if (!token || expires === undefined || expires === null || !String(expires).trim()) return false;
+    let changed = false;
+    for (const [oldUrl, item] of [...resources.entries()]) {
+      if (!String(item.type || '').includes('mpegurl')) continue;
+      const nextUrl = applyFreshTokenToUrl(oldUrl, token, expires, tokenPath, vid);
+      if (nextUrl === oldUrl) continue;
+      changed = true;
+      resources.delete(oldUrl);
+      const nextItem = attachTokenSessionIfEligible({ ...item, url: nextUrl });
+      resources.set(nextUrl, nextItem);
+      if (variantHints.has(oldUrl)) {
+        const hint = variantHints.get(oldUrl);
+        variantHints.delete(oldUrl);
+        variantHints.set(nextUrl, hint);
+      }
+      updateSelectionKey(oldUrl, nextUrl);
+    }
+    if (changed) render();
+    return changed;
+  }
+  function handleTokenRefreshResponse(rawUrl, status, bodyText) {
+    if (status < 200 || status >= 300 || !bodyText) return;
+    let path = '';
+    try { path = new URL(rawUrl, location.href).pathname; } catch { path = ''; }
+    if (!path.endsWith('/api/token/generate')) return;
+    try {
+      const parsed = JSON.parse(bodyText);
+      const data = parsed?.data && typeof parsed.data === 'object' ? parsed.data : parsed;
+      const token = String(data?.token || '').trim();
+      const expires = data?.expires;
+      const tokenPath = String(data?.tokenPath || data?.token_path || '').trim();
+      const vid = data?.vid !== undefined && data?.vid !== null ? String(data.vid).trim() : '';
+      if (!token || expires === undefined || expires === null || !String(expires).trim()) return;
+      const payload = { token, expires, tokenPath, vid };
+      refreshResourcesWithToken(payload);
+      if (window !== window.top) {
+        window.top.postMessage({ kind: tokenRefreshMessageKind, ...payload }, '*');
+      }
+    } catch { /* Ignore non-JSON token responses. */ }
+  }
   const readHeaders = value => {
     try { return Object.fromEntries(new Headers(value).entries()); } catch { return {}; }
   };
@@ -488,6 +762,8 @@
             const text = await readBoundedText(response, maxPlaylistBytes);
             if (text.trimStart().startsWith('#EXTM3U')) ingestM3u8Text(target, text, scoped, allowed);
           })().catch(() => {});
+        } else if (response.ok && new URL(target).pathname.endsWith('/api/token/generate') && typeof response.clone === 'function') {
+          void response.clone().text().then(text => handleTokenRefreshResponse(target, response.status, text)).catch(() => {});
         }
       } catch { /* The original response remains untouched. */ }
       return response;
@@ -526,6 +802,8 @@
           const bodyText = ['', 'text'].includes(this.responseType) ? String(this.responseText || '').slice(0, maxPlaylistBytes) : '';
           if (bodyText.trimStart().startsWith('#EXTM3U')) {
             ingestM3u8Text(target, bodyText, headers, xhrAllowed);
+          } else if (this.status >= 200 && this.status < 300 && new URL(target).pathname.endsWith('/api/token/generate') && bodyText) {
+            handleTokenRefreshResponse(target, this.status, bodyText);
           } else {
             record(target, detected, headers, xhrAllowed);
           }
@@ -537,6 +815,7 @@
 
   let onScan = () => {};
   function scan() {
+    scanTokenSession();
     if (typeof performance !== 'undefined') {
       for (const entry of performance.getEntriesByType('resource')) record(entry.name);
     }
@@ -558,8 +837,29 @@
   if (window !== window.top) return;
 
   window.addEventListener('message', event => {
+    const kind = event.data?.kind;
+    if (kind === tokenSessionMessageKind) {
+      const sess = event.data?.tokenSession;
+      if (sess && typeof sess === 'object' && sess.origin === event.origin && sess.movieId && sess.sessionId && sess.apiSecret) {
+        capturedTokenSession = sess;
+        capturedTokenSessionKey = JSON.stringify(sess);
+        let updated = false;
+        for (const [key, item] of resources.entries()) {
+          if (!item.tokenSession && String(item.type || '').includes('mpegurl') && isSignedHlsCandidate(item.url)) {
+            resources.set(key, { ...item, tokenSession: sess });
+            updated = true;
+          }
+        }
+        if (updated) render();
+      }
+      return;
+    }
+    if (kind === tokenRefreshMessageKind) {
+      refreshResourcesWithToken(event.data);
+      return;
+    }
     const item = event.data?.item;
-    if (event.data?.kind !== messageKind || !item || !event.source) return;
+    if (kind !== messageKind || !item || !event.source) return;
     const url = httpUrl(item.url);
     const frameUrl = httpUrl(item.frameUrl);
     const type = mediaType(url, item.type);
@@ -567,11 +867,13 @@
     const previous = resources.get(url);
     if (resources.size >= 200 && !previous) return;
     const mergedMeta = mergeMeta(previous?.meta, item.meta && typeof item.meta === 'object' ? item.meta : null, url, type);
+    const tokenSession = item.tokenSession || previous?.tokenSession || ((type.includes('mpegurl') && capturedTokenSession && isSignedHlsCandidate(url)) ? capturedTokenSession : undefined);
     resources.set(url, {
       url, frameUrl, type,
       headers: { ...previous?.headers, ...cleanHeaders(item.headers) },
       cookiesAllowed: item.cookiesAllowed !== false,
       ...(mergedMeta ? { meta: mergedMeta } : {}),
+      ...(tokenSession ? { tokenSession } : {}),
     });
     render();
   });
@@ -661,7 +963,7 @@
         header::before{content:'';position:absolute;top:8px;left:calc(50% - 18px);width:36px;height:4px;border-radius:4px;background:#cbd5e1}
         .row-send{min-height:42px;min-width:58px}
       }
-    </style><div id="toast" role="status" aria-live="polite" hidden></div><div id="backdrop" hidden></div><section hidden aria-label="发送媒体到 StreamDock"><header><div class="head-title"><h2>发送到 StreamDock</h2><span class="ver">v1.2.3</span></div><button id="close" aria-label="关闭">关闭</button></header>
+    </style><div id="toast" role="status" aria-live="polite" hidden></div><div id="backdrop" hidden></div><section hidden aria-label="发送媒体到 StreamDock"><header><div class="head-title"><h2>发送到 StreamDock</h2><span class="ver">v1.2.4</span></div><button id="close" aria-label="关闭">关闭</button></header>
       <div class="body">
         <details id="settings"><summary>连接设置</summary><div class="box"><label>StreamDock 地址<input id="server" type="url" placeholder="http://192.168.1.10:6600" /></label>
         <label>访问密码（DS_SECRET）<input id="secret" type="password" autocomplete="off" /></label>
@@ -682,6 +984,17 @@
     const panel = root.querySelector('section');
     const selected = new Set();
     const sendStates = new Map();
+    updateSelectionKey = (oldUrl, nextUrl) => {
+      if (selected.has(oldUrl)) {
+        selected.delete(oldUrl);
+        selected.add(nextUrl);
+      }
+      if (sendStates.has(oldUrl)) {
+        const st = sendStates.get(oldUrl);
+        sendStates.delete(oldUrl);
+        sendStates.set(nextUrl, st);
+      }
+    };
     let busy = false;
     let probing = false;
     let dragged = false;
@@ -1083,11 +1396,21 @@
         const includeCookies = $('cookies').checked;
         const data = [];
         status('正在读取选中媒体的请求信息…');
+        scanTokenSession();
         for (const item of chosen) {
-          const headers = { ...item.headers };
+          let withSession = attachTokenSessionIfEligible(item);
+          const headers = { ...withSession.headers };
           delete headers.cookie;
-          const cookies = includeCookies && item.cookiesAllowed ? await readCookies(item.url) : '';
-          data.push(payloadFor({ ...item, headers }, title, source, cookies));
+          const cookies = includeCookies && withSession.cookiesAllowed ? await readCookies(withSession.url) : '';
+          if (includeCookies && withSession.tokenSession?.playerUrl && !withSession.tokenSession.cookie) {
+            try {
+              const playerCookies = await readCookies(withSession.tokenSession.playerUrl);
+              if (playerCookies) {
+                withSession = { ...withSession, tokenSession: { ...withSession.tokenSession, cookie: playerCookies } };
+              }
+            } catch { /* Ignore if player-origin cookies are unavailable or not authorized. */ }
+          }
+          data.push(payloadFor({ ...withSession, headers }, title, source, cookies));
         }
         const endpoint = new URL(server);
         endpoint.pathname = `${endpoint.pathname.replace(/\/$/, '').replace(/\/api\/cat-catch$/, '')}/api/cat-catch`;

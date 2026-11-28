@@ -176,7 +176,17 @@ impl VideoParser {
         }
 
         let cred_src = info.referer.as_deref().unwrap_or(&url);
-        let request_headers = headers_for_target(cred_src, &info.url, &formatted.headers)?;
+        let mut request_headers = headers_for_target(cred_src, &info.url, &formatted.headers)?;
+        if info.platform.as_deref() == Some("signed_site")
+            && !request_headers.contains_key("origin")
+        {
+            if let Ok(src_url) = Url::parse(cred_src) {
+                if matches!(src_url.scheme(), "http" | "https") {
+                    request_headers
+                        .insert("origin".to_string(), src_url.origin().ascii_serialization());
+                }
+            }
+        }
         let header_map_val = request_headers
             .iter()
             .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))

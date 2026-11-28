@@ -9,18 +9,7 @@ use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 use url::Url;
 
-#[derive(Debug, Clone)]
-pub struct SignedSiteTokenSession {
-    pub origin: String,
-    pub player_url: String,
-    pub base_signed_url: String,
-    pub session_id: String,
-    pub movie_id: String,
-    pub guid_id: String,
-    pub api_secret: String,
-    pub api_secret_issued_at: Option<serde_json::Value>,
-    pub time_diff_ms: i64,
-}
+pub use crate::contract::HlsTokenSession as SignedSiteTokenSession;
 
 #[derive(Debug, Clone)]
 pub struct SignedSiteParseDetail {
@@ -146,10 +135,24 @@ fn apply_query_token(
     expires: &str,
     token_path: &str,
 ) -> CoreResult<String> {
+    apply_query_token_with_vid(base_url, token, expires, token_path, None)
+}
+
+fn apply_query_token_with_vid(
+    base_url: &str,
+    token: &str,
+    expires: &str,
+    token_path: &str,
+    vid: Option<&str>,
+) -> CoreResult<String> {
     let mut u = Url::parse(&normalize_download_url(base_url)?)?;
+    let vid_override = vid.map(str::trim).filter(|s| !s.is_empty());
     let kept: Vec<(String, String)> = u
         .query_pairs()
-        .filter(|(k, _)| !matches!(k.as_ref(), "token" | "expires" | "token_path"))
+        .filter(|(k, _)| {
+            !matches!(k.as_ref(), "token" | "expires" | "token_path")
+                && (vid_override.is_none() || k.as_ref() != "vid")
+        })
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
     {
@@ -165,6 +168,9 @@ fn apply_query_token(
         let norm_tp = normalize_token_path(token_path);
         if !norm_tp.is_empty() {
             qp.append_pair("token_path", &norm_tp);
+        }
+        if let Some(v) = vid_override {
+            qp.append_pair("vid", v);
         }
     }
     Ok(u.to_string())
@@ -375,6 +381,14 @@ pub async fn refresh_token_session(
         session.origin.trim_end_matches('/')
     );
     let mut api_headers = headers.clone();
+    api_headers.remove("cookie");
+    api_headers.remove("authorization");
+    if let Some(ref c) = session.cookie {
+        let trimmed = c.trim();
+        if !trimmed.is_empty() {
+            api_headers.insert("cookie".to_string(), trimmed.to_string());
+        }
+    }
     api_headers.insert("referer".to_string(), session.player_url.clone());
     api_headers.insert("origin".to_string(), session.origin.clone());
     api_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -399,13 +413,23 @@ pub async fn refresh_token_session(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| CoreError::msg("站点未返回有效的刷新 token"))?;
+    if session.base_signed_url.trim().is_empty() {
+        return Err(CoreError::msg("缺少基础播放地址，无法刷新播放凭证"));
+    }
     let token_path = data["tokenPath"].as_str().unwrap_or("");
     let expires = json_value_to_string(&data["expires"]).unwrap_or_default();
     if expires.trim().is_empty() {
         return Err(CoreError::msg("站点未返回刷新 token 有效期"));
     }
+    let next_vid = data.get("vid").and_then(json_value_to_string);
 
-    apply_query_token(&session.base_signed_url, token, &expires, token_path)
+    apply_query_token_with_vid(
+        &session.base_signed_url,
+        token,
+        &expires,
+        token_path,
+        next_vid.as_deref(),
+    )
 }
 
 pub async fn parse_signed_site_detail(
@@ -555,6 +579,7 @@ pub async fn parse_signed_site_detail(
                         api_secret,
                         api_secret_issued_at: cfg.api_secret_issued_at,
                         time_diff_ms: cfg.time_diff_ms,
+                        cookie: None,
                     });
                 }
 

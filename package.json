@@ -1,6 +1,6 @@
 {
   "name": "streamdock",
-  "version": "1.16.2",
+  "version": "1.16.3",
   "private": true,
   "description": "StreamDock — 自托管流媒体批量下载器（Rust 后端 + Vue WebUI），支持 M3U8/HLS、直链下载、完整 RSS 订阅、Emby NFO/海报刮削与移动端 WebUI。",
   "license": "MIT",

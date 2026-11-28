@@ -190,6 +190,26 @@ pub enum HeaderInput {
     Map(BTreeMap<String, serde_json::Value>),
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct HlsTokenSession {
+    pub origin: String,
+    pub player_url: String,
+    #[serde(default)]
+    pub base_signed_url: String,
+    pub session_id: String,
+    pub movie_id: String,
+    #[serde(default)]
+    pub guid_id: String,
+    pub api_secret: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_secret_issued_at: Option<serde_json::Value>,
+    #[serde(default)]
+    pub time_diff_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cookie: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskOptions {
@@ -209,6 +229,8 @@ pub struct TaskOptions {
     pub ignore_segments: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HeaderInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_session: Option<HlsTokenSession>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrape_meta: Option<TaskScrapeMeta>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -972,6 +994,7 @@ pub struct DownloadExecOptions {
     pub proxy_mode: Option<ProxyMode>,
     pub proxy_url: Option<String>,
     pub no_proxy: Option<String>,
+    pub token_session: Option<HlsTokenSession>,
     pub segment_identity: Option<SegmentIdentityFn>,
     pub on_progress: Option<ProgressCallback>,
     pub on_merge_progress: Option<MergeProgressCallback>,

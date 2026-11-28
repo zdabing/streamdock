@@ -364,8 +364,7 @@ impl ProxyInner {
                     let refreshed = (self.refresh)().await?;
                     let next = Url::parse(&normalize_download_url(&refreshed)?)?;
                     if next.origin() != self.origin_url.origin()
-                        || clean_path_without_bcdn(next.path())
-                            != clean_path_without_bcdn(self.origin_url.path())
+                        || !clean_path_without_bcdn(next.path()).starts_with(&self.dir_prefix)
                     {
                         return Err(CoreError::msg("刷新后的媒体地址已变化，请重新开始下载"));
                     }
