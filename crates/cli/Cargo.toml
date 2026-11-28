@@ -1,0 +1,20 @@
+[package]
+name = "streamdock-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "streamdock"
+path = "src/main.rs"
+
+[dependencies]
+streamdock-core = { path = "../core" }
+streamdock-server = { path = "../server" }
+tokio.workspace = true
+tokio-util.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

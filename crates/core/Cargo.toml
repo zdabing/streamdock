@@ -1,0 +1,36 @@
+[package]
+name = "streamdock-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+http.workspace = true
+url.workspace = true
+bytes.workspace = true
+flate2.workspace = true
+brotli.workspace = true
+axum.workspace = true
+aes.workspace = true
+cbc.workspace = true
+md-5.workspace = true
+sha2.workspace = true
+hex.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+unicode-normalization.workspace = true
+regex.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

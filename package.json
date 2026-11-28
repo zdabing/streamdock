@@ -1,0 +1,46 @@
+{
+  "name": "streamdock",
+  "version": "1.16.2",
+  "private": true,
+  "description": "StreamDock — 自托管流媒体批量下载器（Rust 后端 + Vue WebUI），支持 M3U8/HLS、直链下载、完整 RSS 订阅、Emby NFO/海报刮削与移动端 WebUI。",
+  "license": "MIT",
+  "homepage": "https://github.com/zdabing/streamdock",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zdabing/streamdock.git"
+  },
+  "author": "zdabing",
+  "scripts": {
+    "dev": "concurrently \"pnpm dev:server\" \"pnpm dev:frontend\"",
+    "dev:server": "cargo run -p streamdock-cli -- server",
+    "dev:frontend": "pnpm -F streamdock-frontend dev",
+    "start": "cargo run --release -p streamdock-cli -- server",
+    "build": "pnpm build:frontend && cargo build --release -p streamdock-cli",
+    "build:frontend": "pnpm -F streamdock-frontend build",
+    "lint": "pnpm -F streamdock-frontend lint && cargo fmt --all -- --check",
+    "lint:all": "pnpm -F streamdock-frontend lint && cargo fmt --all -- --check",
+    "test": "cargo test --workspace && node --test test/scriptcat.test.cjs",
+    "test:scriptcat": "node --test test/scriptcat.test.cjs",
+    "typecheck": "pnpm -F streamdock-frontend typecheck && cargo check --workspace --all-targets"
+  },
+  "keywords": [
+    "streamdock",
+    "rust",
+    "m3u8",
+    "hls",
+    "mp4",
+    "rss",
+    "emby",
+    "nfo",
+    "scraper",
+    "docker",
+    "ffmpeg"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.12",
+    "concurrently": "^10.0.5"
+  }
+}

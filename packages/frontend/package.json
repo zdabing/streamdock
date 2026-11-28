@@ -1,0 +1,23 @@
+{
+  "name": "streamdock-frontend",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "lint": "biome lint"
+  },
+  "dependencies": {
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "streamdock": "workspace:*",
+    "@types/node": "^26.4.1",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "typescript": "^6",
+    "vite": "^8.2.2",
+    "vue-tsc": "^3.3.13"
+  }
+}

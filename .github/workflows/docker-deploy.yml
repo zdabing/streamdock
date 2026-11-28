@@ -1,0 +1,290 @@
+# doc: https://docs.github.com/zh/actions/use-cases-and-examples/publishing-packages/publishing-docker-images
+# doc: https://docs.github.com/zh/packages/managing-github-packages-using-github-actions-workflows/publishing-and-installing-a-package-with-github-actions
+name: 'Publish Container Image'
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-deploy.yml'
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+  workflow_dispatch:
+
+concurrency:
+  group: container-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME_REPO: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      build-artifact-name: ${{ steps.build.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.com
+
+      - uses: pnpm/action-setup@v6
+        id: pnpm-install
+        with:
+          version: 11
+          run_install: false
+
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path)" >> $GITHUB_OUTPUT
+      - uses: actions/cache@v6
+        name: Setup pnpm cache
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store
+
+      - name: Install dependencies
+        run: |
+          if [ -f "pnpm-lock.yaml" ]; then
+            pnpm install --frozen-lockfile --ignore-scripts=false
+          else
+            echo "Warning: pnpm-lock.yaml not found, installing without frozen-lockfile"
+            pnpm install --no-frozen-lockfile --ignore-scripts=false
+          fi
+
+      - name: Build & verify frontend and ScriptCat
+        run: |
+          pnpm build:frontend
+          pnpm -F streamdock-frontend lint
+          pnpm -F streamdock-frontend typecheck
+          node --test test/scriptcat.test.cjs
+
+      - name: Prepare build artifacts
+        id: build
+        run: |
+          mkdir -p build-artifacts
+          cp -r client build-artifacts/
+          ARTIFACT_NAME="build-artifacts-${{ github.sha }}"
+          echo "artifact-name=$ARTIFACT_NAME" >> $GITHUB_OUTPUT
+          echo "Artifact name: $ARTIFACT_NAME"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.artifact-name }}
+          path: build-artifacts
+          retention-days: 1
+
+  build-image:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.build-artifact-name }}
+          path: build-artifacts
+
+      - name: Prepare build artifacts for Docker
+        run: |
+          if [ -d "build-artifacts/client" ]; then
+            cp -rf build-artifacts/client .
+            echo "Prebuilt frontend artifacts prepared"
+            ls -la client
+          else
+            echo "Warning: build-artifacts/client not found, Dockerfile will build frontend from source"
+          fi
+
+      - name: Resolve image repository
+        id: repo
+        shell: bash
+        run: |
+          echo "image=ghcr.io/$(echo "${{ env.IMAGE_NAME_REPO }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.repo.outputs.image }}
+          flavor: |
+            latest=true
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{major}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build image for startup test
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MAINTAINER=${{ github.repository_owner }}
+            SOURCE_COMMIT=${{ github.sha }}
+            USE_PREBUILT=true
+          load: true
+          tags: streamdock:smoke
+          cache-from: type=gha,scope=downloader-${{ matrix.arch }}
+          cache-to: type=gha,scope=downloader-${{ matrix.arch }},mode=max
+
+      - name: Check downloader container
+        shell: bash
+        run: |
+          docker run -d --name streamdock-smoke -p 127.0.0.1:16600:6600 streamdock:smoke
+          trap 'docker logs streamdock-smoke; docker rm -f streamdock-smoke' EXIT
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:16600/healthcheck; then
+              docker exec streamdock-smoke sh -c '! command -v chromium && ! command -v chromium-browser && streamdock --version && ffmpeg -version'
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
+
+      - name: Build and push by digest
+        id: docker_build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MAINTAINER=${{ github.repository_owner }}
+            SOURCE_COMMIT=${{ github.sha }}
+            USE_PREBUILT=true
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ steps.repo.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=downloader-${{ matrix.arch }}
+
+      - name: Export digest
+        shell: bash
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.docker_build.outputs.digest }}"
+          [ -n "$digest" ]
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build-image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Resolve image repository
+        id: repo
+        shell: bash
+        run: |
+          echo "image=ghcr.io/$(echo "${{ env.IMAGE_NAME_REPO }}" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ steps.repo.outputs.image }}
+          flavor: |
+            latest=true
+          tags: |
+            type=raw,value=latest
+            type=semver,pattern={{version}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{major}},enable=${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create multi-platform manifest
+        id: merge
+        shell: bash
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          IMAGE_REPO="${{ steps.repo.outputs.image }}"
+          TAGS_ARGS=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && TAGS_ARGS+=(--tag "$tag")
+          done <<< "${{ steps.meta.outputs.tags }}"
+          DIGEST_ARGS=()
+          for f in *; do
+            [ -f "$f" ] && DIGEST_ARGS+=("${IMAGE_REPO}@sha256:${f}")
+          done
+          docker buildx imagetools create "${TAGS_ARGS[@]}" "${DIGEST_ARGS[@]}"
+          FIRST_TAG=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" | head -n 1)
+          MERGED_DIGEST=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$FIRST_TAG" | tr -d '"')
+          echo "digest=$MERGED_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.repo.outputs.image }}
+          subject-digest: ${{ steps.merge.outputs.digest }}
+          push-to-registry: true
+
+      - name: Image digest
+        shell: bash
+        run: |
+          echo "Image digest: ${{ steps.merge.outputs.digest }}"
+          echo "Tags: ${{ steps.meta.outputs.tags }}"
